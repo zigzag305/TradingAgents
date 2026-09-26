@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "quantfury-trading": {
+      "type": "http",
+      "url": "https://ai.quantfury.com/mcp"
+    }
+  }
+}
