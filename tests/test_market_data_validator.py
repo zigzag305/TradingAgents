@@ -74,3 +74,91 @@ class TestTool:
             {"symbol": "COF", "curr_date": "2026-05-20"}
         )
         assert "Verified market data snapshot for COF" in out
+
+
+def _frame(closes, start="2025-01-01", spread=1.0) -> pd.DataFrame:
+    dates = pd.bdate_range(start, periods=len(closes))
+    opens = [closes[0]] + list(closes[:-1])
+    return pd.DataFrame({
+        "Date": dates,
+        "Open": opens,
+        "High": [max(o, c) + spread for o, c in zip(opens, closes)],
+        "Low": [min(o, c) - spread for o, c in zip(opens, closes)],
+        "Close": closes,
+        "Volume": [1_000_000] * len(closes),
+    })
+
+
+RISE = [40 + 0.4 * i for i in range(200)]
+FLAG = [120 + (2.5 if i % 2 else -0.5) for i in range(10)]   # prior 10-row low ~118.5
+
+
+def _snapshot(monkeypatch, closes, today=None):
+    frame = _frame(closes)
+    monkeypatch.setattr(validator, "load_ohlcv", lambda s, d: frame)
+    monkeypatch.setattr(validator, "_today_dates", lambda: {today} if today else set())
+    last = frame["Date"].iloc[-1].strftime("%Y-%m-%d")
+    return validator.build_verified_market_snapshot("SOL-USD", last), frame
+
+
+@pytest.mark.unit
+class TestSessionStructure:
+    """The analyst is told not to assert % moves or range breaks without tool
+    support; this section is that support, computed from the verified rows."""
+
+    def test_breakdown_in_uptrend_is_stated_as_a_pullback(self, monkeypatch):
+        snap, _ = _snapshot(monkeypatch, RISE + FLAG + [116.0])
+        assert "### Session & structure" in snap
+        assert "closed BELOW the prior 10-row low" in snap
+        assert "x ATR(14)" in snap
+        assert "Trend regime: uptrend" in snap
+        assert "Reading: a pullback inside the uptrend: bearish on a days horizon" in snap
+
+    def test_inside_range_day_reports_the_range_and_no_reading(self, monkeypatch):
+        snap, _ = _snapshot(monkeypatch, RISE + FLAG + [120.5])
+        assert "stayed inside the prior 10-row range" in snap
+        assert "Reading:" not in snap
+
+    def test_breakout_with_the_trend_is_continuation(self, monkeypatch):
+        snap, _ = _snapshot(monkeypatch, RISE + FLAG + [126.0])
+        assert "closed ABOVE the prior 10-row high" in snap
+        assert "continuation" in snap
+
+    def test_current_day_row_is_flagged_as_possibly_forming(self, monkeypatch):
+        closes = RISE + FLAG + [116.0]
+        last_day = _frame(closes)["Date"].iloc[-1].date()
+        snap, _ = _snapshot(monkeypatch, closes, today=last_day)
+        assert "may still be forming" in snap
+        snap, _ = _snapshot(monkeypatch, closes, today=None)
+        assert "may still be forming" not in snap
+
+    def test_short_history_says_so_instead_of_guessing_a_trend(self, monkeypatch):
+        snap, _ = _snapshot(monkeypatch, [100 + i for i in range(30)])
+        assert "not enough history for a 50/200-day trend read" in snap
+
+    def test_sideways_market_is_not_called_a_trend(self, monkeypatch):
+        import math
+        snap, _ = _snapshot(monkeypatch, [100 + 5 * math.sin(i / 6) for i in range(220)])
+        assert "no trend: the 50-day and 200-day have converged" in snap
+
+    def test_guidance_permits_citing_the_computed_section(self, monkeypatch):
+        snap, _ = _snapshot(monkeypatch, RISE + FLAG + [116.0])
+        assert "'Session & structure' figures are computed from these verified rows" in snap
+
+
+@pytest.mark.unit
+def test_indicator_table_refuses_partial_window_averages(monkeypatch):
+    # stockstats fills short histories with a partial-window mean, which would
+    # pass a 30-row average off as a verified 200-day SMA.
+    snap, _ = _snapshot(monkeypatch, [100 + i for i in range(30)])
+    assert "| close_200_sma | N/A (needs 200 rows, have 30) |" in snap
+    assert "| close_50_sma | N/A (needs 50 rows, have 30) |" in snap
+    assert "| close_10_ema | N/A" not in snap   # 30 rows is enough for a 10-row EMA
+
+
+@pytest.mark.unit
+def test_atr_scaling_is_omitted_without_enough_rows(monkeypatch):
+    snap, _ = _snapshot(monkeypatch, [100 + i for i in range(10)])
+    assert "| atr | N/A (needs 15 rows, have 10) |" in snap
+    assert "x ATR(14)" not in snap
+    assert "Latest session" in snap   # the % move is still reported
